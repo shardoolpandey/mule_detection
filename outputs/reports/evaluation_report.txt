@@ -1,0 +1,22 @@
+======================================================================
+  MULE DETECTION SYSTEM — EVALUATION REPORT
+======================================================================
+
+── MODEL PERFORMANCE (test set) ──────────────────────────
+           Model  Precision  Recall    F1  PR-AUC  ROC-AUC
+ IsolationForest      0.845   0.845 0.845  0.9199   0.9965
+    RandomForest      1.000   1.000 1.000  1.0000   1.0000
+GradientBoosting      1.000   1.000 1.000  1.0000   1.0000
+
+── EARLY DETECTION (Objective 2) ────────────────────────
+  Total mule accounts      : 258
+  Caught at early stage    : 2
+  Early Detection Gain     : 0.78%
+  Stage distribution       : {'Laundering': 256, 'Recruitment': 2}
+
+── COMMUNITY DETECTION ──────────────────────────────────
+  Suspicious communities   : 0
+  Community recall         : 0.00%
+
+── SUSPICIOUS ACCOUNT SUMMARY ───────────────────────────
+  Total suspicious accounts: 250
