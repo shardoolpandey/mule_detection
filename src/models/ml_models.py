@@ -54,6 +54,83 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
             if c not in drop and pd.api.types.is_numeric_dtype(df[c])]
 
 
+def _time_aware_train_test_split(
+    feature_matrix: pd.DataFrame,
+    feat_cols: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Prefer a chronological split when temporal metadata is available."""
+    if "last_seen_ts" in feature_matrix.columns:
+        ordered = feature_matrix.sort_values("last_seen_ts").reset_index(drop=True)
+        split_idx = int(len(ordered) * (1 - TEST_SIZE))
+        split_idx = min(max(split_idx, 1), len(ordered) - 1)
+        train_df = ordered.iloc[:split_idx]
+        test_df = ordered.iloc[split_idx:]
+
+        if train_df["is_fraud"].nunique() > 1 and test_df["is_fraud"].nunique() > 1:
+            return (
+                train_df[feat_cols].values,
+                test_df[feat_cols].values,
+                train_df["is_fraud"].values,
+                test_df["is_fraud"].values,
+                ordered["account"].values,
+            )
+
+    X = feature_matrix[feat_cols].values
+    y = feature_matrix["is_fraud"].values
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=TEST_SIZE,
+        random_state=RANDOM_STATE, stratify=y
+    )
+    return X_tr, X_te, y_tr, y_te, feature_matrix["account"].values
+
+
+def _fit_threshold(
+    model,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+) -> float:
+    """
+    Fit on a train subset, tune decision threshold on a validation subset,
+    then refit on the full training fold.
+    """
+    if len(np.unique(y_train)) < 2 or len(y_train) < 10:
+        if sample_weight is None:
+            model.fit(X_train, y_train)
+        else:
+            model.fit(X_train, y_train, sample_weight=sample_weight)
+        return 0.5
+
+    X_fit, X_val, y_fit, y_val, sw_fit, _ = train_test_split(
+        X_train,
+        y_train,
+        sample_weight if sample_weight is not None else np.ones(len(y_train)),
+        test_size=VALIDATION_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y_train,
+    )
+
+    if sample_weight is None:
+        model.fit(X_fit, y_fit)
+        fit_kwargs = {}
+    else:
+        model.fit(X_fit, y_fit, sample_weight=sw_fit)
+        fit_kwargs = {"sample_weight": sample_weight}
+
+    val_prob = model.predict_proba(X_val)[:, 1]
+    precision, recall, thresholds = precision_recall_curve(y_val, val_prob)
+    if len(thresholds) == 0:
+        threshold = 0.5
+    else:
+        f1_scores = (2 * precision[:-1] * recall[:-1]) / (
+            precision[:-1] + recall[:-1] + 1e-9
+        )
+        threshold = float(thresholds[int(np.nanargmax(f1_scores))])
+
+    model.fit(X_train, y_train, **fit_kwargs)
+    return threshold
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. ISOLATION FOREST (unsupervised)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -101,7 +178,7 @@ def train_isolation_forest(
 
     if "is_fraud" in feature_matrix.columns:
         y_true = feature_matrix["is_fraud"].values
-        if y_true.sum() > 0:
+        if np.unique(y_true).size > 1 and y_true.sum() > 0:
             pr_auc = average_precision_score(y_true, anom_scores)
             roc    = roc_auc_score(y_true, anom_scores)
             print(f"  PR-AUC  : {pr_auc:.4f}")
@@ -126,14 +203,10 @@ def train_random_forest(
     print("\n--- Training Random Forest ---")
     feat_cols = _get_feature_cols(feature_matrix)
     X = feature_matrix[feat_cols].values
-    y = feature_matrix["is_fraud"].values
 
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_scaled, y, test_size=TEST_SIZE,
-        random_state=RANDOM_STATE, stratify=y
+    X_tr, X_te, y_tr, y_te, accs = _time_aware_train_test_split(
+        feature_matrix,
+        feat_cols,
     )
 
     rf = RandomForestClassifier(
@@ -144,10 +217,10 @@ def train_random_forest(
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    rf.fit(X_tr, y_tr)
+    threshold = _fit_threshold(rf, X_tr, y_tr)
 
     y_prob = rf.predict_proba(X_te)[:, 1]
-    y_pred = rf.predict(X_te)
+    y_pred = (y_prob >= threshold).astype(int)
 
     pr_auc  = average_precision_score(y_te, y_prob)
     roc_auc = roc_auc_score(y_te, y_prob)
@@ -164,8 +237,8 @@ def train_random_forest(
     print(fi.head(10).to_string())
 
     # Full-dataset probabilities
-    all_proba = rf.predict_proba(X_scaled)[:, 1]
-    all_preds = rf.predict(X_scaled)
+    all_proba = rf.predict_proba(X)[:, 1]
+    all_preds = (all_proba >= threshold).astype(int)
     accs      = feature_matrix["account"].values
 
     results = {
@@ -174,11 +247,12 @@ def train_random_forest(
         "proba":      pd.Series(all_proba, index=accs, name="rf_proba"),
         "preds":      pd.Series(all_preds, index=accs, name="rf_pred"),
         "feat_importance": fi,
+        "threshold":  threshold,
         "y_test":     y_te,
         "y_prob_test": y_prob,
         "y_pred_test": y_pred,
     }
-    return rf, scaler, results
+    return rf, None, results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -196,12 +270,9 @@ def train_gradient_boosting(
     X = feature_matrix[feat_cols].values
     y = feature_matrix["is_fraud"].values
 
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_scaled, y, test_size=TEST_SIZE,
-        random_state=RANDOM_STATE, stratify=y
+    X_tr, X_te, y_tr, y_te, _ = _time_aware_train_test_split(
+        feature_matrix,
+        feat_cols,
     )
 
     # Class weight via sample_weight
@@ -215,10 +286,10 @@ def train_gradient_boosting(
         max_depth=GB_MAX_DEPTH,
         random_state=RANDOM_STATE,
     )
-    gb.fit(X_tr, y_tr, sample_weight=sample_weight)
+    threshold = _fit_threshold(gb, X_tr, y_tr, sample_weight=sample_weight)
 
     y_prob = gb.predict_proba(X_te)[:, 1]
-    y_pred = gb.predict(X_te)
+    y_pred = (y_prob >= threshold).astype(int)
 
     pr_auc  = average_precision_score(y_te, y_prob)
     roc_auc = roc_auc_score(y_te, y_prob)
@@ -228,8 +299,8 @@ def train_gradient_boosting(
     print(classification_report(y_te, y_pred,
                                 target_names=["Normal", "Mule"], digits=4))
 
-    all_proba = gb.predict_proba(X_scaled)[:, 1]
-    all_preds = gb.predict(X_scaled)
+    all_proba = gb.predict_proba(X)[:, 1]
+    all_preds = (all_proba >= threshold).astype(int)
     accs      = feature_matrix["account"].values
 
     results = {
@@ -237,11 +308,12 @@ def train_gradient_boosting(
         "roc_auc":     roc_auc,
         "proba":       pd.Series(all_proba, index=accs, name="gb_proba"),
         "preds":       pd.Series(all_preds, index=accs, name="gb_pred"),
+        "threshold":   threshold,
         "y_test":      y_te,
         "y_prob_test": y_prob,
         "y_pred_test": y_pred,
     }
-    return gb, scaler, results
+    return gb, None, results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -252,7 +324,8 @@ def build_ensemble_scores(
     iso_scores: pd.Series,
     rf_proba:   pd.Series,
     gb_proba:   pd.Series,
-    weights:    tuple = (0.20, 0.45, 0.35),
+    gnn_proba:  pd.Series | None = None,
+    weights:    tuple | None = None,
 ) -> pd.Series:
     """
     Combine model scores into a single ensemble suspicion score.
@@ -263,12 +336,30 @@ def build_ensemble_scores(
         return (s - mn) / (mx - mn + 1e-9)
 
     common = iso_scores.index.intersection(rf_proba.index).intersection(gb_proba.index)
-    score  = (
-        weights[0] * _norm(iso_scores.loc[common]) +
-        weights[1] * rf_proba.loc[common] +
-        weights[2] * gb_proba.loc[common]
-    )
-    return score.rename("ensemble_score")
+
+    components = [
+        _norm(iso_scores.loc[common]).rename("iso"),
+        rf_proba.loc[common].rename("rf"),
+        gb_proba.loc[common].rename("gb"),
+    ]
+    component_weights = list(weights or (0.20, 0.45, 0.35))
+
+    if gnn_proba is not None:
+        common = common.intersection(gnn_proba.index)
+        components = [
+            _norm(iso_scores.loc[common]).rename("iso"),
+            rf_proba.loc[common].rename("rf"),
+            gb_proba.loc[common].rename("gb"),
+            gnn_proba.loc[common].rename("gnn"),
+        ]
+        component_weights = list(weights or (0.15, 0.35, 0.25, 0.25))
+
+    score = pd.Series(0.0, index=common, dtype=float)
+    total_weight = sum(component_weights)
+    for component, weight in zip(components, component_weights):
+        score = score.add(component * weight, fill_value=0)
+
+    return (score / total_weight).rename("ensemble_score")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -54,6 +54,9 @@ GRAPH_SELF_LOOPS       = False     # whether to allow self-loops
 BETWEENNESS_K          = 200       # number of samples for approx. betweenness
 PAGERANK_ALPHA         = 0.85
 PAGERANK_MAX_ITER      = 200
+LARGE_GRAPH_THRESHOLD  = 20_000    # reduce expensive graph metrics beyond this
+LARGE_BETWEENNESS_K    = 64
+CLUSTERING_SKIP_THRESHOLD = 50_000 # skip clustering on very large graphs
 
 # ── Lifecycle detection ───────────────────────────────────────────────────────
 WINDOW_SIZES_DAYS      = [1, 3, 7, 14, 30]   # sliding windows for temporal features
@@ -80,10 +83,24 @@ GB_MAX_DEPTH           = 5
 ISO_N_ESTIMATORS       = 200
 ISO_CONTAMINATION      = "auto"     # set to float if mule rate is known
 
+# ── GNN / Graph DB extensions ────────────────────────────────────────────────
+GNN_DEFAULT_MODEL      = "sage"
+GNN_DEFAULT_EPOCHS     = 200
+GNN_DEFAULT_PATIENCE   = 25
+GNN_HIDDEN1            = 128
+GNN_HIDDEN2            = 64
+
+NEO4J_URI              = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER             = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD         = os.getenv("NEO4J_PASSWORD", "")
+NEO4J_DATABASE         = os.getenv("NEO4J_DATABASE", "neo4j")
+NEO4J_BATCH_SIZE       = 5_000
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 TEST_SIZE              = 0.20
 RANDOM_STATE           = 42
 CV_FOLDS               = 5
+VALIDATION_SIZE        = 0.20
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 PLOT_DPI               = 150

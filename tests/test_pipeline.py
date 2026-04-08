@@ -24,6 +24,8 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 import unittest
+import tempfile
+from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -105,6 +107,68 @@ class TestDataGenerator(unittest.TestCase):
             (df["sender_account"] != df["receiver_account"]).all(),
             "Self-loop transactions found"
         )
+
+
+class TestPaySimLoader(unittest.TestCase):
+
+    def _write_paysim_fixture(self, rows: list[dict]) -> str:
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        path = Path(tmp_dir.name) / "paysim_fixture.csv"
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return str(path)
+
+    def test_load_paysim_keeps_all_fraud_rows_when_sampling(self):
+        from src.ingestion.data_loader import load_paysim
+
+        rows = [
+            {
+                "step": i + 1,
+                "type": "TRANSFER" if i % 2 == 0 else "CASH_OUT",
+                "amount": float(100 + i),
+                "nameOrig": f"C{i}",
+                "oldbalanceOrg": float(1000 + i),
+                "newbalanceOrig": float(900 + i),
+                "nameDest": f"D{i}",
+                "oldbalanceDest": 0.0,
+                "newbalanceDest": float(100 + i),
+                "isFraud": int(i < 2),
+                "isFlaggedFraud": 0,
+            }
+            for i in range(10)
+        ]
+        path = self._write_paysim_fixture(rows)
+
+        df = load_paysim(path=path, sample_n=5)
+
+        self.assertEqual(int(df["is_fraud"].sum()), 2)
+        self.assertEqual(len(df), 5)
+
+    def test_load_paysim_adds_balance_features(self):
+        from src.ingestion.data_loader import load_paysim
+
+        rows = [{
+            "step": 1,
+            "type": "TRANSFER",
+            "amount": 200.0,
+            "nameOrig": "C1",
+            "oldbalanceOrg": 200.0,
+            "newbalanceOrig": 0.0,
+            "nameDest": "D1",
+            "oldbalanceDest": 0.0,
+            "newbalanceDest": 0.0,
+            "isFraud": 1,
+            "isFlaggedFraud": 0,
+        }]
+        path = self._write_paysim_fixture(rows)
+
+        df = load_paysim(path=path)
+
+        for col in [
+            "sender_drained", "dest_no_increase", "origin_balance_error",
+            "dest_balance_error", "balance_error_flag", "type",
+        ]:
+            self.assertIn(col, df.columns)
 
 
 class TestGraphBuilder(unittest.TestCase):
@@ -272,6 +336,29 @@ class TestMLModels(unittest.TestCase):
         rf, _, results = train_random_forest(self.fm)
         feat_cols = _get_feature_cols(self.fm)
         self.assertEqual(len(results["feat_importance"]), len(feat_cols))
+
+    def test_graph_sage_runs_when_available(self):
+        from src.features.feature_engineering import get_feature_columns
+        from src.gnn.gnn_models import TORCH_AVAILABLE
+
+        if not TORCH_AVAILABLE:
+            self.skipTest("torch/torch_geometric not installed")
+
+        from src.gnn.gnn_models import train_graph_sage
+
+        feat_cols = get_feature_columns(self.fm)
+        results = train_graph_sage(
+            self.fm,
+            self.df,
+            feat_cols,
+            n_epochs=10,
+            patience=5,
+            hidden1=32,
+            hidden2=16,
+        )
+        self.assertIn("proba_series", results)
+        self.assertEqual(len(results["proba_series"]), len(self.fm))
+        self.assertIn("test_results", results)
 
 
 class TestLifecycleDetector(unittest.TestCase):

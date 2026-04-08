@@ -100,20 +100,96 @@ def load_paysim(path=None, sample_n: int = None) -> pd.DataFrame:
     path = path or PAYSIM_PATH
     print(f"Loading PaySim from {path}...")
     df = pd.read_csv(path)
+    print(f"  Raw rows: {len(df):,}")
 
-    # Filter to money-moving transaction types
     if "type" in df.columns:
         df = df[df["type"].isin(["TRANSFER", "CASH_OUT"])].copy()
         print(f"  Filtered to TRANSFER/CASH_OUT: {len(df):,} rows")
+    else:
+        df = df.copy()
 
     col_map = _resolve_columns(df)
     out = _normalise(df, col_map, "PaySim")
-    out = out.sort_values("timestamp").reset_index(drop=True)
+
+    if "type" in df.columns:
+        out["type"] = df["type"].astype(str).values
+    else:
+        out["type"] = "UNKNOWN"
+
+    numeric_cols = [
+        "oldbalanceOrg", "newbalanceOrig",
+        "oldbalanceDest", "newbalanceDest",
+        "step", "isFlaggedFraud",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            out[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    out["sender_drained"] = (
+        (out.get("newbalanceOrig", 0) <= 1.0) &
+        (out.get("oldbalanceOrg", 0) > 0)
+    ).astype(int)
+    out["dest_no_increase"] = (
+        (out.get("newbalanceDest", 0) - out.get("oldbalanceDest", 0)) < 1.0
+    ).astype(int)
+    out["is_round_amount"] = (
+        (out["transaction_amount"] > 0) &
+        (np.mod(out["transaction_amount"], TEST_TX_ROUND_MODULO) == 0)
+    ).astype(int)
+
+    out["origin_balance_delta"] = (
+        out.get("oldbalanceOrg", 0) - out.get("newbalanceOrig", 0)
+    )
+    out["dest_balance_delta"] = (
+        out.get("newbalanceDest", 0) - out.get("oldbalanceDest", 0)
+    )
+    out["origin_balance_error"] = (
+        out["origin_balance_delta"] - out["transaction_amount"]
+    ).abs()
+    out["dest_balance_error"] = (
+        out["dest_balance_delta"] - out["transaction_amount"]
+    ).abs()
+    out["balance_error_flag"] = (
+        (out["origin_balance_error"] > 1.0) |
+        (out["dest_balance_error"] > 1.0)
+    ).astype(int)
     out["source"] = "paysim"
+    out = out.sort_values("timestamp").reset_index(drop=True)
 
     if sample_n and len(out) > sample_n:
-        out = out.sample(sample_n, random_state=RANDOM_STATE).reset_index(drop=True)
-        print(f"  Sampled to {sample_n:,} rows")
+        fraud_df = out[out["is_fraud"] == 1]
+        normal_df = out[out["is_fraud"] == 0]
+        if len(fraud_df) >= sample_n:
+            n_fraud = max(sample_n // 2, 1)
+            n_normal = max(sample_n - n_fraud, 1)
+            fraud_df = fraud_df.sample(min(n_fraud, len(fraud_df)), random_state=RANDOM_STATE)
+            if len(normal_df) > n_normal:
+                normal_df = normal_df.sample(n_normal, random_state=RANDOM_STATE)
+            print(
+                f"  Sample size below fraud count; using {len(fraud_df):,} fraud and "
+                f"{len(normal_df):,} normal rows"
+            )
+        else:
+            n_normal = max(sample_n - len(fraud_df), 0)
+            if n_normal < len(normal_df):
+                normal_df = normal_df.sample(n_normal, random_state=RANDOM_STATE)
+        out = (
+            pd.concat([fraud_df, normal_df], ignore_index=True)
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        print(f"  Sampled to {len(out):,} rows (kept all {len(fraud_df):,} fraud rows)")
+
+    save_cols = [
+        "sender_account", "receiver_account", "transaction_amount", "timestamp",
+        "is_fraud", "type", "oldbalanceOrg", "newbalanceOrig",
+        "oldbalanceDest", "newbalanceDest", "sender_drained",
+        "dest_no_increase", "is_round_amount", "origin_balance_error",
+        "dest_balance_error", "balance_error_flag",
+    ]
+    canonical_path = DATA_PROCESSED / "paysim_canonical.csv"
+    out[[c for c in save_cols if c in out.columns]].to_csv(canonical_path, index=False)
+    print(f"  Saved canonical PaySim → {canonical_path}")
 
     _print_summary(out, "PaySim")
     return out

@@ -43,6 +43,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Optional
 import json
+from glob import glob
 
 # ── FastAPI import guard ──────────────────────────────────────────────────────
 try:
@@ -92,6 +93,7 @@ class AccountScoreResponse(BaseModel):
     is_flagged:       bool
     lifecycle_stage:  Optional[str]
     top_risk_factors: list[dict]
+    score_components: dict
     model_version:    str
     scored_at:        str
 
@@ -105,6 +107,8 @@ class ModelRegistry:
         self.rf_bundle        = None
         self.gb_bundle        = None
         self.iso_bundle       = None
+        self.gnn_scores       = None
+        self.model_predictions = None
         self.feature_matrix   = None
         self.lifecycle_df     = None
         self.model_version    = "1.0.0"
@@ -135,11 +139,22 @@ class ModelRegistry:
                 self.iso_bundle = pickle.load(f)
             print(f"  ISO loaded: {iso_path}")
 
+        gnn_files = sorted(glob(str(OUTPUTS_RESULTS / "gnn_*_proba.csv")))
+        if gnn_files:
+            gnn_path = gnn_files[-1]
+            self.gnn_scores = pd.read_csv(gnn_path).set_index("account")["gnn_proba"]
+            print(f"  GNN scores loaded: {len(self.gnn_scores):,} accounts ({os.path.basename(gnn_path)})")
+
         # Feature matrix (for lookup)
         fm_path = DATA_PROCESSED / "feature_matrix.csv"
         if fm_path.exists():
             self.feature_matrix = pd.read_csv(fm_path).set_index("account")
             print(f"  Feature matrix loaded: {len(self.feature_matrix):,} accounts")
+
+        pred_path = OUTPUTS_RESULTS / "model_predictions.csv"
+        if pred_path.exists():
+            self.model_predictions = pd.read_csv(pred_path).set_index("account")
+            print(f"  Model predictions loaded: {len(self.model_predictions):,} accounts")
 
         # Lifecycle labels
         lc_path = DATA_PROCESSED / "lifecycle_results.csv"
@@ -193,6 +208,27 @@ def _ensemble_score(registry: ModelRegistry, x_scaled: np.ndarray) -> float:
     return sum(s * w for _, s, w in scores) / total_w
 
 
+def _lookup_precomputed_score(account_id: str, registry: ModelRegistry) -> dict | None:
+    """Use stored predictions when available, including optional GNN scores."""
+    if registry.model_predictions is None or account_id not in registry.model_predictions.index:
+        return None
+
+    row = registry.model_predictions.loc[account_id]
+    score = row.get("ensemble_score")
+    if pd.isna(score):
+        return None
+
+    details = {
+        "ensemble_score": float(score),
+        "iso_score": None if pd.isna(row.get("iso_score")) else float(row.get("iso_score")),
+        "rf_proba": None if pd.isna(row.get("rf_proba")) else float(row.get("rf_proba")),
+        "gb_proba": None if pd.isna(row.get("gb_proba")) else float(row.get("gb_proba")),
+    }
+    if "gnn_proba" in row.index and not pd.isna(row.get("gnn_proba")):
+        details["gnn_proba"] = float(row.get("gnn_proba"))
+    return details
+
+
 def _top_features(registry: ModelRegistry, x_scaled: np.ndarray,
                   feat_cols: list, n: int = 5) -> list[dict]:
     """Return top N features driving the suspicion score."""
@@ -234,7 +270,8 @@ def score_account(account_id: str, registry: ModelRegistry,
     x_scaled = scaler.transform(x_raw)
 
     # ── Score ─────────────────────────────────────────────────────────────────
-    score = _ensemble_score(registry, x_scaled)
+    precomputed = _lookup_precomputed_score(account_id, registry)
+    score = precomputed["ensemble_score"] if precomputed is not None else _ensemble_score(registry, x_scaled)
 
     # ── Lifecycle stage ───────────────────────────────────────────────────────
     stage = None
@@ -251,6 +288,7 @@ def score_account(account_id: str, registry: ModelRegistry,
         "is_flagged":       score >= 0.50,
         "lifecycle_stage":  stage,
         "top_risk_factors": top_rf,
+        "score_components": precomputed or {},
         "model_version":    registry.model_version,
         "scored_at":        datetime.utcnow().isoformat() + "Z",
     }
@@ -280,6 +318,7 @@ if FASTAPI_AVAILABLE:
                 "random_forest":    registry.rf_bundle  is not None,
                 "gradient_boosting":registry.gb_bundle  is not None,
                 "isolation_forest": registry.iso_bundle is not None,
+                "gnn_scores":       registry.gnn_scores is not None,
             },
             "n_accounts_indexed": (
                 len(registry.feature_matrix)
@@ -302,6 +341,7 @@ if FASTAPI_AVAILABLE:
                     ("random_forest",     registry.rf_bundle),
                     ("gradient_boosting", registry.gb_bundle),
                     ("isolation_forest",  registry.iso_bundle),
+                    ("gnn_scores",        registry.gnn_scores),
                 ] if b is not None
             ],
         }

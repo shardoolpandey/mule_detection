@@ -67,9 +67,16 @@ def plot_transaction_network(
         # Sample: keep all fraud nodes + random normals
         fraud_nodes  = [n for n, d in G.nodes(data=True) if d.get("is_fraud")]
         normal_nodes = [n for n, d in G.nodes(data=True) if not d.get("is_fraud")]
-        n_normal     = min(max_nodes - len(fraud_nodes), len(normal_nodes))
         rng          = np.random.default_rng(RANDOM_STATE)
-        sample_norm  = list(rng.choice(normal_nodes, n_normal, replace=False))
+        n_fraud      = min(len(fraud_nodes), max_nodes)
+        if len(fraud_nodes) > n_fraud:
+            fraud_nodes = list(rng.choice(fraud_nodes, n_fraud, replace=False))
+
+        n_normal     = min(max(max_nodes - len(fraud_nodes), 0), len(normal_nodes))
+        sample_norm  = (
+            list(rng.choice(normal_nodes, n_normal, replace=False))
+            if n_normal > 0 else []
+        )
         keep         = set(fraud_nodes + sample_norm)
         G            = G.subgraph(keep).copy()
 

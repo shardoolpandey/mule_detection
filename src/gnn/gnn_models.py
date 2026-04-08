@@ -58,6 +58,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score, classification_report
 import warnings
 warnings.filterwarnings("ignore")
@@ -225,18 +226,41 @@ def prepare_pyg_data(
 
     edge_index = torch.tensor([src_ids, dst_ids], dtype=torch.long)
 
-    # ── Train / val / test masks (stratified) ─────────────────────────────────
-    n        = len(fm)
-    perm     = torch.randperm(n, generator=torch.Generator().manual_seed(RANDOM_STATE))
-    tr_end   = int(0.70 * n)
-    val_end  = int(0.85 * n)
+    # ── Train / val / test masks (prefer stratified when labels permit) ──────
+    n = len(fm)
+    all_idx = np.arange(n)
+    y_np = y.numpy()
+
+    if len(np.unique(y_np)) > 1 and y_np.sum() >= 3 and (y_np == 0).sum() >= 3:
+        tr_idx, holdout_idx = train_test_split(
+            all_idx,
+            test_size=0.30,
+            random_state=RANDOM_STATE,
+            stratify=y_np,
+        )
+        holdout_y = y_np[holdout_idx]
+        stratify_holdout = holdout_y if len(np.unique(holdout_y)) > 1 else None
+        val_idx, test_idx = train_test_split(
+            holdout_idx,
+            test_size=0.50,
+            random_state=RANDOM_STATE,
+            stratify=stratify_holdout,
+        )
+    else:
+        rng = np.random.default_rng(RANDOM_STATE)
+        perm = rng.permutation(n)
+        tr_end = int(0.70 * n)
+        val_end = int(0.85 * n)
+        tr_idx = perm[:tr_end]
+        val_idx = perm[tr_end:val_end]
+        test_idx = perm[val_end:]
 
     train_mask = torch.zeros(n, dtype=torch.bool)
-    val_mask   = torch.zeros(n, dtype=torch.bool)
-    test_mask  = torch.zeros(n, dtype=torch.bool)
-    train_mask[perm[:tr_end]]           = True
-    val_mask[perm[tr_end:val_end]]      = True
-    test_mask[perm[val_end:]]           = True
+    val_mask = torch.zeros(n, dtype=torch.bool)
+    test_mask = torch.zeros(n, dtype=torch.bool)
+    train_mask[tr_idx] = True
+    val_mask[val_idx] = True
+    test_mask[test_idx] = True
 
     data = Data(
         x=x, edge_index=edge_index, y=y,
@@ -446,6 +470,22 @@ def train_gnn(
             "y_pred_test": y_pred_te,
         },
     }
+
+
+def train_graph_sage(
+    feature_matrix: pd.DataFrame,
+    df_transactions: pd.DataFrame,
+    feat_cols: list[str],
+    **kwargs,
+) -> dict:
+    """Convenience wrapper for the default GraphSAGE detector."""
+    return train_gnn(
+        feature_matrix=feature_matrix,
+        df_transactions=df_transactions,
+        feat_cols=feat_cols,
+        model_type="sage",
+        **kwargs,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -106,8 +106,13 @@ def score_communities(
     print("  Scoring community suspicion levels...")
 
     # Map accounts to features
-    fm = feature_matrix.set_index("account") if "account" in feature_matrix.columns \
-         else feature_matrix
+    fm = feature_matrix.copy()
+    if "account" not in fm.columns:
+        fm = fm.reset_index()
+
+    fm["community_id"] = fm["account"].map(partition)
+    fm = fm.dropna(subset=["community_id"]).copy()
+    fm["community_id"] = fm["community_id"].astype(int)
 
     community_records = []
 
@@ -116,23 +121,44 @@ def score_communities(
     for node, cid in partition.items():
         comm_to_nodes[cid].append(node)
 
-    for cid, nodes in comm_to_nodes.items():
-        if len(nodes) < MIN_COMMUNITY_SIZE:
-            continue
+    agg_spec = {"account": "size"}
+    for col in [
+        "is_fraud", "pagerank", "betweenness",
+        "passthrough_ratio", "burst_ratio", "tx_velocity_7d",
+    ]:
+        if col in fm.columns:
+            agg_spec[col] = "mean"
 
-        # Account subset in feature matrix
-        node_feats = fm.loc[fm.index.isin(nodes)]
+    grouped = fm.groupby("community_id").agg(agg_spec).rename(columns={
+        "account": "size",
+        "is_fraud": "mule_rate",
+        "pagerank": "avg_pagerank",
+        "betweenness": "avg_betweenness",
+        "passthrough_ratio": "avg_passthrough",
+        "burst_ratio": "avg_burst_ratio",
+        "tx_velocity_7d": "avg_velocity_7d",
+    })
 
-        mule_rate    = node_feats["is_fraud"].mean()  if "is_fraud" in node_feats.columns else 0
-        avg_pr       = node_feats["pagerank"].mean()  if "pagerank" in node_feats.columns else 0
-        avg_btw      = node_feats["betweenness"].mean() if "betweenness" in node_feats.columns else 0
-        avg_pass     = node_feats["passthrough_ratio"].mean() if "passthrough_ratio" in node_feats.columns else 0
-        avg_burst    = node_feats["burst_ratio"].mean() if "burst_ratio" in node_feats.columns else 0
-        avg_velocity = node_feats["tx_velocity_7d"].mean() if "tx_velocity_7d" in node_feats.columns else 0
+    grouped["accounts"] = grouped.index.map(comm_to_nodes.get)
+    grouped = grouped[grouped["size"] >= MIN_COMMUNITY_SIZE].copy()
+
+    if grouped.empty:
+        print("  Communities analysed  : 0")
+        print("  Flagged as suspicious : 0")
+        return pd.DataFrame()
+
+    for cid, row in grouped.iterrows():
+        nodes = row["accounts"]
+        n = int(row["size"])
+        mule_rate = float(row.get("mule_rate", 0.0))
+        avg_pr = float(row.get("avg_pagerank", 0.0))
+        avg_btw = float(row.get("avg_betweenness", 0.0))
+        avg_pass = float(row.get("avg_passthrough", 0.0))
+        avg_burst = float(row.get("avg_burst_ratio", 0.0))
+        avg_velocity = float(row.get("avg_velocity_7d", 0.0))
 
         # Internal edge density
         subgraph = G.subgraph(nodes)
-        n = len(nodes)
         max_edges = n * (n - 1)
         density = subgraph.number_of_edges() / max_edges if max_edges > 0 else 0
 

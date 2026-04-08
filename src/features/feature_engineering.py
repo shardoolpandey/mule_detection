@@ -71,9 +71,9 @@ def compute_node_features(df: pd.DataFrame) -> pd.DataFrame:
         drain_rate = sent["sender_drained"].mean().rename("drain_rate")
 
     # Pass-through ratio
-    all_accounts = pd.Index(
-        set(df["sender_account"]).union(set(df["receiver_account"]))
-    )
+    all_accounts = pd.Index(pd.unique(
+        pd.concat([df["sender_account"], df["receiver_account"]], ignore_index=True)
+    ))
     feats = pd.DataFrame(index=all_accounts)
     feats.index.name = "account"
 
@@ -95,8 +95,9 @@ def compute_node_features(df: pd.DataFrame) -> pd.DataFrame:
     feats["degree_ratio"]      = (feats["n_sent"] + 1) / (feats["n_recv"] + 1)
 
     # Round-amount rate (test transaction signal)
-    round_mask = df["transaction_amount"].apply(
-        lambda x: x > 0 and x % TEST_TX_ROUND_MODULO == 0
+    round_mask = (
+        (df["transaction_amount"] > 0) &
+        (np.mod(df["transaction_amount"], TEST_TX_ROUND_MODULO) == 0)
     )
     round_sent = df[round_mask].groupby("sender_account").size().rename("round_tx_count")
     feats = feats.join(round_sent, how="left")
@@ -112,9 +113,39 @@ def compute_node_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         feats["cashout_rate"] = 0.0
 
+    if {"origin_balance_error", "dest_balance_error", "balance_error_flag"}.issubset(df.columns):
+        sender_balance_error = sent["origin_balance_error"].mean().rename("avg_origin_balance_error")
+        receiver_balance_error = recv["dest_balance_error"].mean().rename("avg_dest_balance_error")
+        sender_error_flag = sent["balance_error_flag"].mean().rename("sender_balance_error_rate")
+        receiver_error_flag = recv["balance_error_flag"].mean().rename("receiver_balance_error_rate")
+        feats = feats.join(sender_balance_error, how="left")
+        feats = feats.join(receiver_balance_error, how="left")
+        feats = feats.join(sender_error_flag, how="left")
+        feats = feats.join(receiver_error_flag, how="left")
+    else:
+        feats["avg_origin_balance_error"] = 0.0
+        feats["avg_dest_balance_error"] = 0.0
+        feats["sender_balance_error_rate"] = 0.0
+        feats["receiver_balance_error_rate"] = 0.0
+
+    if "dest_no_increase" in df.columns:
+        feats = feats.join(
+            recv["dest_no_increase"].mean().rename("dest_no_increase_rate"),
+            how="left"
+        )
+    else:
+        feats["dest_no_increase_rate"] = 0.0
+
+    if "type" in df.columns:
+        type_mix = (
+            pd.crosstab(df["sender_account"], df["type"], normalize="index")
+            .rename(columns=lambda c: f"sender_type_{str(c).lower()}_rate")
+        )
+        feats = feats.join(type_mix, how="left")
+
     print(f"    Computed {len(feats.columns)} behavioral features for "
           f"{len(feats):,} accounts")
-    return feats
+    return feats.fillna(0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -140,17 +171,29 @@ def compute_graph_features(G: nx.DiGraph) -> pd.DataFrame:
     print("done")
 
     # Betweenness centrality (approx) — money passes *through* mule bridges
-    print(f"    Betweenness centrality (k={BETWEENNESS_K})...", end=" ", flush=True)
+    betweenness_k = BETWEENNESS_K
+    if len(nodes) > LARGE_GRAPH_THRESHOLD:
+        betweenness_k = min(LARGE_BETWEENNESS_K, len(nodes))
+
+    print(f"    Betweenness centrality (k={betweenness_k})...", end=" ", flush=True)
     betweenness = nx.betweenness_centrality(
-        G, k=min(BETWEENNESS_K, len(nodes)), normalized=True, weight="total_amount"
+        G, k=min(betweenness_k, len(nodes)), normalized=True, weight="total_amount"
     )
     print("done")
 
-    # Clustering coefficient (undirected view)
-    print("    Clustering coefficient...", end=" ", flush=True)
-    G_und = G.to_undirected()
-    clustering = nx.clustering(G_und, weight="total_amount")
-    print("done")
+    # Clustering coefficient is one of the slowest metrics on large sparse graphs.
+    # For big PaySim runs we skip it so the pipeline can reach model training.
+    if len(nodes) > CLUSTERING_SKIP_THRESHOLD:
+        print(
+            f"    Clustering coefficient skipped (> {CLUSTERING_SKIP_THRESHOLD:,} nodes); "
+            "using 0.0 fallback"
+        )
+        clustering = {n: 0.0 for n in nodes}
+    else:
+        print("    Clustering coefficient...", end=" ", flush=True)
+        G_und = G.to_undirected()
+        clustering = nx.clustering(G_und, weight="total_amount")
+        print("done")
 
     # Weakly connected component size — mule clusters form large components
     comp_map = {}
@@ -192,97 +235,93 @@ def compute_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     print("  Computing temporal features...")
 
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df["date"]      = df["timestamp"].dt.date
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
 
-    all_accounts = list(
-        set(df["sender_account"]).union(set(df["receiver_account"]))
+    activity = pd.concat([
+        df[["sender_account", "timestamp", "transaction_amount"]].rename(
+            columns={"sender_account": "account"}
+        ),
+        df[["receiver_account", "timestamp", "transaction_amount"]].rename(
+            columns={"receiver_account": "account"}
+        ),
+    ], ignore_index=True)
+    activity = activity.sort_values(["account", "timestamp"]).reset_index(drop=True)
+
+    if activity.empty:
+        return pd.DataFrame()
+
+    summary = activity.groupby("account").agg(
+        first_seen_ts=("timestamp", "min"),
+        last_seen_ts=("timestamp", "max"),
+    )
+    summary["active_days"] = (
+        (summary["last_seen_ts"] - summary["first_seen_ts"]).dt.days.clip(lower=1)
     )
 
-    records = []
+    gaps = (
+        activity.groupby("account")["timestamp"]
+        .diff()
+        .dt.total_seconds()
+        .div(86400)
+    )
+    summary["max_gap_days"] = gaps.groupby(activity["account"]).max().fillna(0)
 
-    # Pre-group for performance
-    by_sender = {k: v for k, v in df.groupby("sender_account")}
-    by_recv   = {k: v for k, v in df.groupby("receiver_account")}
+    weekly = (
+        activity.assign(week=activity["timestamp"].dt.to_period("W"))
+        .groupby(["account", "week"])
+        .size()
+        .rename("weekly_count")
+        .reset_index()
+    )
+    weekly_stats = weekly.groupby("account")["weekly_count"].agg(
+        max_weekly_txns="max",
+        mean_weekly_txns="mean",
+        weekly_std="std",
+    )
+    weekly_stats["burst_ratio"] = (
+        weekly_stats["max_weekly_txns"] /
+        weekly_stats["mean_weekly_txns"].clip(lower=1)
+    )
+    weekly_stats["weekly_cv"] = (
+        weekly_stats["weekly_std"].fillna(0) /
+        weekly_stats["mean_weekly_txns"].replace(0, np.nan)
+    ).fillna(0)
+    weekly_stats = weekly_stats.drop(columns=["weekly_std"])
 
-    for acc in all_accounts:
-        sent_grp = by_sender.get(acc, pd.DataFrame())
-        recv_grp = by_recv.get(acc, pd.DataFrame())
+    sent_activity = df[["sender_account", "timestamp", "transaction_amount"]].rename(
+        columns={"sender_account": "account"}
+    )
+    sent_activity = sent_activity.sort_values(["account", "timestamp"]).reset_index(drop=True)
+    sent_activity["ref_ts"] = sent_activity.groupby("account")["timestamp"].transform("max")
+    sent_age_days = (
+        sent_activity["ref_ts"] - sent_activity["timestamp"]
+    ).dt.total_seconds().div(86400)
+    sent_activity["vel_1d"] = (sent_age_days <= 1).astype(int)
+    sent_activity["vel_7d"] = (sent_age_days <= 7).astype(int)
+    sent_activity["vel_30d"] = (sent_age_days <= 30).astype(int)
 
-        cols_needed = ["timestamp", "transaction_amount"]
-        sent_slice  = sent_grp[cols_needed] if len(sent_grp) > 0 else pd.DataFrame(columns=cols_needed)
-        recv_slice  = recv_grp[cols_needed] if len(recv_grp) > 0 else pd.DataFrame(columns=cols_needed)
-        all_tx = pd.concat([sent_slice, recv_slice])
+    velocity = sent_activity.groupby("account").agg(
+        tx_velocity_1d=("vel_1d", "sum"),
+        tx_velocity_7d=("vel_7d", "sum"),
+        tx_velocity_30d=("vel_30d", "sum"),
+    )
 
-        if len(all_tx) == 0:
-            records.append({"account": acc})
-            continue
+    first_sent = sent_activity.groupby("account").head(5).copy()
+    first_sent["small_round_flag"] = (
+        (first_sent["transaction_amount"] < TEST_TX_MAX_AMOUNT) &
+        (np.mod(first_sent["transaction_amount"], TEST_TX_ROUND_MODULO) == 0)
+    ).astype(int)
+    small_round = first_sent.groupby("account")["small_round_flag"].sum().rename("small_round_txns")
 
-        all_tx = all_tx.copy()
-        all_tx["timestamp"] = pd.to_datetime(all_tx["timestamp"], errors="coerce")
-        all_tx = all_tx.dropna(subset=["timestamp"]).sort_values("timestamp")
-
-        if len(all_tx) == 0:
-            records.append({"account": acc})
-            continue
-
-        first  = all_tx["timestamp"].min()
-        last   = all_tx["timestamp"].max()
-        active_days = max((last - first).days, 1)
-
-        # Max inactivity gap (dormancy before activation)
-        gaps = all_tx["timestamp"].diff().dt.total_seconds() / 86400
-        max_gap = float(gaps.max()) if len(gaps) > 1 else 0.0
-
-        # Weekly transaction counts → burst ratio
-        all_tx["week"] = all_tx["timestamp"].dt.isocalendar().week.astype(int)
-        wc = all_tx.groupby("week").size()
-        max_weekly  = int(wc.max())
-        mean_weekly = float(wc.mean())
-        burst_ratio = max_weekly / max(mean_weekly, 1)
-
-        # Coefficient of variation (stability — high = erratic, mule-like)
-        weekly_cv = float(wc.std() / mean_weekly) if mean_weekly > 0 else 0.0
-
-        # Transaction velocity per window (sent only)
-        n_sent = len(sent_grp)
-        vel_1d = vel_7d = vel_30d = 0
-        if n_sent > 0:
-            sent_grp = sent_grp.copy()
-            sent_grp["timestamp"] = pd.to_datetime(sent_grp["timestamp"])
-            ref = sent_grp["timestamp"].max()
-            vel_1d  = int((sent_grp["timestamp"] >= ref - pd.Timedelta(days=1) ).sum())
-            vel_7d  = int((sent_grp["timestamp"] >= ref - pd.Timedelta(days=7) ).sum())
-            vel_30d = int((sent_grp["timestamp"] >= ref - pd.Timedelta(days=30)).sum())
-
-        # Sudden wakeup: long gap then burst
-        sudden_wakeup = int(max_gap > DORMANT_GAP_DAYS and burst_ratio > BURST_RATIO_THRESHOLD)
-
-        # Small test transaction detection
-        small_round = 0
-        if len(sent_grp) > 0:
-            early = sent_grp.head(5)
-            small_round = int(
-                ((early["transaction_amount"] < TEST_TX_MAX_AMOUNT) &
-                 (early["transaction_amount"] % TEST_TX_ROUND_MODULO == 0)).sum()
-            )
-
-        records.append({
-            "account":          acc,
-            "active_days":      active_days,
-            "max_gap_days":     max_gap,
-            "burst_ratio":      burst_ratio,
-            "weekly_cv":        weekly_cv,
-            "max_weekly_txns":  max_weekly,
-            "mean_weekly_txns": mean_weekly,
-            "tx_velocity_1d":   vel_1d,
-            "tx_velocity_7d":   vel_7d,
-            "tx_velocity_30d":  vel_30d,
-            "sudden_wakeup":    sudden_wakeup,
-            "small_round_txns": small_round,
-        })
-
-    feats = pd.DataFrame(records).set_index("account").fillna(0)
+    feats = summary.join(weekly_stats, how="left")
+    feats = feats.join(velocity, how="left")
+    feats = feats.join(small_round, how="left")
+    feats["sudden_wakeup"] = (
+        (feats["max_gap_days"] > DORMANT_GAP_DAYS) &
+        (feats["burst_ratio"] > BURST_RATIO_THRESHOLD)
+    ).astype(int)
+    feats = feats.fillna(0)
     print(f"    Computed {len(feats.columns)} temporal features for "
           f"{len(feats):,} accounts")
     return feats
@@ -323,8 +362,17 @@ def build_feature_matrix(
     if labels is not None:
         master["is_fraud"] = labels.reindex(master.index).fillna(0).astype(int)
     elif "is_fraud" in df.columns:
+        fraud_accounts = pd.concat([
+            df.loc[df["is_fraud"] == 1, ["sender_account"]].rename(
+                columns={"sender_account": "account"}
+            ),
+            df.loc[df["is_fraud"] == 1, ["receiver_account"]].rename(
+                columns={"receiver_account": "account"}
+            ),
+        ], ignore_index=True)
         fraud_map = (
-            df.groupby("sender_account")["is_fraud"]
+            fraud_accounts.assign(is_fraud=1)
+            .groupby("account")["is_fraud"]
             .max()
             .reindex(master.index)
             .fillna(0)

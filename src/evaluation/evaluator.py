@@ -36,7 +36,7 @@ def evaluate_model(
     pra = average_precision_score(y_true, y_prob) if y_true.sum() > 0 else 0.0
     roc = roc_auc_score(y_true, y_prob)          if y_true.sum() > 0 else 0.0
 
-    cm  = confusion_matrix(y_true, y_pred)
+    cm  = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn  = cm[0, 0]; fp = cm[0, 1]; fn = cm[1, 0]; tp = cm[1, 1]
 
     if verbose:
@@ -78,12 +78,14 @@ def evaluate_early_detection(lifecycle_df: pd.DataFrame) -> dict:
     print(f"  Total mule accounts   : {total:,}")
     print(f"  Caught early          : {early:,} ({edg:.2%})")
     print(f"  Stage distribution    : {stage_dist}")
+    print("  Status                : heuristic / not independently validated")
 
     return {
         "total_mules": total,
         "early_detected": early,
         "early_detection_gain": round(edg, 4),
         "stage_distribution": stage_dist,
+        "status": "heuristic",
     }
 
 
@@ -147,12 +149,25 @@ def compile_report(
     lines.append(df[["Model","Precision","Recall","F1","PR-AUC","ROC-AUC"]]
                  .to_string(index=False))
 
+    perf_df = df[df["Model"].isin(["RandomForest", "GradientBoosting", "GNN-SAGE", "GNN-GAT"])].copy()
+    if not perf_df.empty and "PR-AUC" in perf_df.columns:
+        best_idx = perf_df["PR-AUC"].astype(float).idxmax()
+        best = perf_df.loc[best_idx]
+        lines.append("\n── RECOMMENDED MODEL ─────────────────────────────────────")
+        lines.append(
+            f"  Best validation model : {best['Model']} "
+            f"(PR-AUC={float(best['PR-AUC']):.4f}, ROC-AUC={float(best['ROC-AUC']):.4f})"
+        )
+        lines.append("  Recommendation        : Use this as the primary fraud detector on PaySim.")
+
     if early_detection:
         lines.append("\n── EARLY DETECTION (Objective 2) ────────────────────────")
         lines.append(f"  Total mule accounts      : {early_detection.get('total_mules', 0):,}")
         lines.append(f"  Caught at early stage    : {early_detection.get('early_detected', 0):,}")
         lines.append(f"  Early Detection Gain     : {early_detection.get('early_detection_gain', 0):.2%}")
         lines.append(f"  Stage distribution       : {early_detection.get('stage_distribution', {})}")
+        lines.append(f"  Status                   : {early_detection.get('status', 'unvalidated')}")
+        lines.append("  Interpretation           : Treat lifecycle output as heuristic until separately validated.")
 
     if community_eval:
         lines.append("\n── COMMUNITY DETECTION ──────────────────────────────────")
